@@ -438,10 +438,3 @@ class TinyHttpdServer:
         self.server_handle.close()
 
 
-def list_root(path, request, ack):
-    if 'ok' in ack.user:
-        return {'done': True, 'body':'hello world'}
-    else:
-        ack.user['ok'] = True
-        return {'done': False, 'body':'hello world'}
-
