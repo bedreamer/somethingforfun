@@ -3,6 +3,7 @@ import socket
 import time
 import select
 import sys
+import json
 
 
 class HttpRule:
@@ -22,18 +23,14 @@ class HttpRule:
 
 class HttpAck:
     def __init__(self, session, request, route):
-        self.status = 'HTTP/1.1 ' + ' OK\r\n'
-        self.headers = {
-            'Date': self.getdate(),
-            'Content-Type': self.getfiletype(),
-            'Connection': 'keep-alive'
-        }
+        self.headers = {}
         self.ack_done = False
         self.request = request
         self.route = route
         self.body = None
         self.http_head_done = False
         self.user = {}
+        self.EOH = '\r\n'
 
     def getdate(self):
         return '1970-01-01 00:00:00'
@@ -41,19 +38,32 @@ class HttpAck:
     def getfiletype(self):
         return 'text/html; charset=utf-8'
 
+    # 获取状态。
     def get_http_header(self, code, status):
         header = 'HTTP/1.1 %d %s\r\n' % (code, status)
         for key in self.headers:
             header = header + '%s: %s\r\n' % (key, self.headers[key])
-        header = header + '\r\n'
+
+        if 'Server' not in self.headers:
+            header = header + 'Server: TinyHttpServer 1.0 By LiJie\r\n'
+        if 'Content-Type' not in self.headers:
+            header = header + 'Content-Type: text/html; charset=utf-8\r\n'
+        if 'Date' not in self.headers:
+            header = header + 'Date: %s\r\n' % time.ctime()
+        if 'Cache-Control' not in self.headers:
+            header = header + 'Cache-Control: no-cache\r\n'
+
+        header = header
 
         return header
 
-    def return_unormal(self, code):
+    # 返回异常状态
+    def return_unormal(self, code, status):
         self.ack_done = True
         self.http_head_done = True
-        return self.get_http_header(404, 'Not Found')
+        return self.get_http_header(code, status) + self.EOH
 
+    # 返回正常状态
     def return_normal(self, user_ack_data):
         http_head = ''
         if self.http_head_done is False:
@@ -61,31 +71,75 @@ class HttpAck:
             http_head = self.get_http_header(200, 'OK')
 
         body = user_ack_data
-        return http_head + body
+        return http_head + self.EOH + body
 
+    '''
+        ack 是字典结构
+        ack中的 ‘done’， 字段默认为True，即若返回非None字典，则表明应答处理完成。
+        ack中的 ’code‘， 字段默认为 200，
+        ack中的 ‘status’，字段默认为 OK
+        ack中的 ‘Server’，字段默认为 TinyHttpServer
+        ack中的 ’Content-Type‘，字段默认为：text/html; charset=utf-8
+    '''
     def process_ack(self):
         for rule in self.route:
-            if rule.is_match(self.request.path) is True:
-                ack_data = rule.callback(self.request.path, self.request, self)
-                if ack_data is not None:
+            if rule.is_match(self.request.path) is False:
+                continue
 
-                    if self.http_head_done is False:
-                        body = self.return_normal(ack_data['body'])
-                    else:
-                        body = ack_data['body']
-
-                    if ack_data['done'] is True:
-                        self.ack_done = True
-
-                    if body is not None:
-                        return body
-                    else:
-                        return None
-
-                # pending.
+            ack_data = rule.callback(self.request.path, self.request, self)
+            if ack_data is None:
                 return None
 
-        return self.return_unormal(404)
+            # 如果返回字符串也认为是有效返回
+            if type(ack_data) == type('str'):
+                ack_data = {'body': ack_data}
+
+            if type(ack_data) != type({}):
+                return self.return_unormal(503, 'Internal error')
+
+            ack_done = True
+            code = 200
+            status = 'OK'
+            http_ack_header = ''
+            ack = ''
+            http_ack_body = ''
+            if 'done' in ack_data:
+                if ack_data['done'] != False and ack_data['done'] != True:
+                    return self.return_unormal(503, 'Internal error')
+                else:
+                    ack_done = ack_data['done']
+
+            # 无论是什么状态，若HTTP头部未准备好则处理头部。
+            # 头部准备好的条件是：ack_done为True或字段中出现body
+            if self.http_head_done is False:
+                if 'code' in ack_data:
+                    code = ack_data['code']
+                if 'status' in ack_data:
+                    status = ack_data['status']
+                http_ack_header = self.get_http_header(code, status)
+
+                if ack_done is True:
+                    self.http_head_done = True
+                if 'body' in ack_data:
+                    self.http_head_done = True
+
+            # 处理应答完成标识
+            if ack_done is True:
+                self.ack_done = True
+
+            if 'body' in ack_data:
+                http_ack_body = ack_data['body']
+
+            if self.http_head_done is True:
+                http_ack_header = http_ack_header + self.EOH
+
+            if len(http_ack_header) + len(http_ack_body):
+                return http_ack_header + http_ack_body
+            else:
+                # may data not ready.
+                return None
+
+        return self.return_unormal(404, 'Not Found!')
 
 class HttpRequest:
     def __init__(self, session):
@@ -376,6 +430,17 @@ class TinyHttpdServer:
         self.server_handle.bind(('0.0.0.0', self.server_port))
         self.server_handle.listen(1)
         self.server_handle.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+
+        # 注册连接信息
+        self.route('/httpd/connections.json', self.connection_statistics)
+
+    def connection_statistics(self, path, request, ack):
+        j = []
+        for s in self.sessions:
+            j.append({'conn': repr(s.addr), 'tsp': s.born_tsp, 'last': s.last_heartbeat})
+            ack.headers['Content-Type'] = 'application/json'
+
+        return json.dumps(j)
 
     def debug(self, e):
         if self.debug_on is True:
