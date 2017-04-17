@@ -7,9 +7,10 @@ import json
 
 
 class HttpRule:
-    def __init__(self, path, callback):
+    def __init__(self, path, callback, content):
         self.path = path
         self.callback = callback
+        self.content = content
 
     def is_match(self, path):
         if self.path == path:
@@ -32,15 +33,13 @@ class HttpAck:
         self.user = {}
         self.EOH = '\r\n'
 
-    def getdate(self):
-        return '1970-01-01 00:00:00'
-
-    def getfiletype(self):
-        return 'text/html; charset=utf-8'
-
     # 获取状态。
-    def get_http_header(self, code, status):
+    def get_http_header(self, rule, code, status):
         header = 'HTTP/1.1 %d %s\r\n' % (code, status)
+
+        if rule is not None:
+            self.headers['Content-Type'] = rule.content
+
         for key in self.headers:
             header = header + '%s: %s\r\n' % (key, self.headers[key])
 
@@ -61,14 +60,14 @@ class HttpAck:
     def return_unormal(self, code, status):
         self.ack_done = True
         self.http_head_done = True
-        return self.get_http_header(code, status) + self.EOH
+        return self.get_http_header(None, code, status) + self.EOH
 
     # 返回正常状态
     def return_normal(self, user_ack_data):
         http_head = ''
         if self.http_head_done is False:
             self.http_head_done = True
-            http_head = self.get_http_header(200, 'OK')
+            http_head = self.get_http_header(None, 200, 'OK')
 
         body = user_ack_data
         return http_head + self.EOH + body
@@ -116,7 +115,7 @@ class HttpAck:
                     code = ack_data['code']
                 if 'status' in ack_data:
                     status = ack_data['status']
-                http_ack_header = self.get_http_header(code, status)
+                http_ack_header = self.get_http_header(rule, code, status)
 
                 if ack_done is True:
                     self.http_head_done = True
@@ -271,6 +270,7 @@ class HttpConnection:
         handle = self.session.handle
         try:
             data = handle.recv(1024)
+            #print '<', data, '>'
         except Exception,e:
             self.request_broken = True
             return
@@ -333,9 +333,10 @@ class HttpSession:
         self.connection = HttpConnection(self, route)
 
     # 等待HTTP请求发送完成
-    def pending_with_http_request(self):
-        # 使用链接执行请求处理
-        self.connection.do_request()
+    def pending_with_http_request(self, rl):
+        if self.handle in rl:
+            # 使用链接执行请求处理
+            self.connection.do_request()
 
         # HTTP请求数据接收完成
         if self.connection.is_request_done() is True:
@@ -352,9 +353,10 @@ class HttpSession:
         return self.SESSION_WAIT_DATA
 
     # 等待http应答完成
-    def pending_with_http_ack(self):
-        # 执行应答
-        self.connection.do_ack()
+    def pending_with_http_ack(self, wl):
+        if self.handle in wl:
+            # 执行应答
+            self.connection.do_ack()
 
         # HTTP请求数据接收完成
         if self.connection.is_ack_done():
@@ -377,11 +379,11 @@ class HttpSession:
     # 返回None, 结束会话
     def step_forward(self, rl, wl, el):
         if self.status == self.SESSION_WAIT_DATA:
-            self.status = self.pending_with_http_request()
+            self.status = self.pending_with_http_request(rl)
 
         # 若请求完成则可以立即处理
         if self.status == self.SESSION_PATCH_DATA:
-            self.status = self.pending_with_http_ack()
+            self.status = self.pending_with_http_ack(wl)
 
         if self.status == self.SESSION_WAIT_DONE:
             if self.handle in wl:
@@ -434,6 +436,7 @@ class TinyHttpdServer:
         # 注册连接信息
         self.route('/httpd/connections.json', self.connection_statistics)
 
+    # 统计所有连接信息
     def connection_statistics(self, path, request, ack):
         j = []
         for s in self.sessions:
@@ -447,8 +450,10 @@ class TinyHttpdServer:
             print e
 
     # 添加一个路由
-    def route(self, path, callback):
-        r = HttpRule(path, callback)
+    def route(self, path, callback, content=None):
+        if content is None:
+            content = 'text/html; charset=utf-8'
+        r = HttpRule(path, callback, content)
         self.routes.append(r)
 
     # 安装所有有效的可用与select操作的描述符
@@ -485,7 +490,7 @@ class TinyHttpdServer:
         i = 0
         while i < len(self.sessions):
             session = self.sessions[i]
-            status = session.step_forward(rl, wl, el)
+            status = session.step_forward(r, w, [])
             if status == None:
                 session.shut_down()
                 self.sessions[i] = None
